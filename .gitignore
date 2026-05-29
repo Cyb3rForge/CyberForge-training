@@ -1,0 +1,28 @@
+# Python/runtime
+.venv/
+.venv-*/
+__pycache__/
+*.py[cod]
+
+# Local secrets and environment files
+.env
+.env.*
+*_key.txt
+*key*.txt
+*secret*.txt
+*token*.txt
+*.pem
+*.p12
+*.p8
+
+# Generated training data and artifacts
+data/processed/
+runs/
+wandb/
+slurm_logs/
+*.log
+*.out
+*.err
+*.safetensors
+*.bin
+*.pt

@@ -1,0 +1,74 @@
+exp_name: gemma4-31b-full-mini-swe-secbench-modelonly-r3
+output_dir: runs/${exp_name}
+
+# Model
+model_id: google/gemma-4-31B-it
+tokenizer_id: google/gemma-4-31B-it
+initial_model_id: ${INITIAL_MODEL_ID}
+attn_implementation: sdpa
+dtype: bf16
+train_scope: language_model
+
+# Dataset
+dataset:
+  data_files: data/processed/gemma4_agent_trajectories.jsonl
+  conversation_column: messages
+  conversation_style: gemma4_native_tool_calls
+  train_on_input: false
+  turn_by_turn: true
+  max_seq_len: 8192
+  cache_dir: data/processed/cache
+  max_train_examples: 0
+  eval_fraction: 0.03
+
+# Optimizer and scheduler
+optimizer:
+  name: adamw_torch_fused
+  weight_decay: 0.01
+  lr: 1.0e-5
+lr_scheduler:
+  name: cosine
+  warmup_ratio: 0.03
+
+# Training
+seed: 42
+shuffle: true
+batch_size: 1
+epochs: 3
+max_steps: 1108
+gradient_accumulation_steps: 1
+gradient_checkpointing: false
+max_grad_norm: 1.0
+
+# FSDP, analogous to SWE-smith's torchtune full_finetune_distributed recipe.
+fsdp:
+  strategy: full_shard auto_wrap
+  transformer_layer_cls_to_wrap:
+    - Gemma4TextDecoderLayer
+  backward_prefetch: backward_pre
+  forward_prefetch: false
+  activation_checkpointing: true
+  state_dict_type: SHARDED_STATE_DICT
+  use_orig_params: true
+  sync_module_states: true
+  cpu_ram_efficient_loading: true
+
+# Logging/checkpointing
+wandb:
+  project: vuljector-secbench
+  group: ${exp_name}
+  job_type: full_finetune_fsdp
+  key_file: ${WANDB_KEY_FILE}
+hub:
+  upload_checkpoints: true
+  repo_id: MananSuri27/gemma4-31b-full-mini-swe-secbench
+  token_file: ${HF_KEY_FILE}
+  private: false
+  repo_type: model
+  fail_on_error: false
+log_every_n_steps: 1
+save_steps: 500
+save_total_limit: 1
+save_only_model: true
+save_final_model: false
+eval_steps: 500
