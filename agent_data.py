@@ -34,10 +34,16 @@ GEMMA_PENDING_TOOL_RESPONSE = "<|tool_response>"
 SECRET_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"sk-[A-Za-z0-9_-]{20,}"), "[REDACTED_OPENAI_KEY]"),
     (re.compile(r"hf_[A-Za-z0-9]{20,}"), "[REDACTED_HF_TOKEN]"),
+    (re.compile(r"gh[pousr]_[A-Za-z0-9]{20,}"), "[REDACTED_GITHUB_TOKEN]"),
+    # KEY=value / KEY: value for any identifier containing api_key/token/secret/
+    # password (e.g. AZURE_API_KEY, OPENAI_API_KEY, GITHUB_TOKEN). The previous
+    # value class `[^\"'\s,}\\]]+` had a misplaced `]` so it required a literal
+    # `]` after the value and never matched real secrets — fixed here.
     (
         re.compile(
-            r"(?i)(api[_-]?key|access[_-]?token|auth[_-]?token|secret|password)"
-            r"([\"']?\s*[:=]\s*[\"']?)([^\"'\s,}\\]]+)"
+            r"(?i)([A-Za-z0-9_]*(?:api[_-]?key|access[_-]?token|auth[_-]?token|secret|token|password)[A-Za-z0-9_]*)"
+            r"([\"']?\s*[:=]\s*[\"']?)"
+            r"([^\s\"',}\]]+)"
         ),
         r"\1\2[REDACTED_SECRET]",
     ),
@@ -97,6 +103,17 @@ def normalize_messages(messages: Iterable[dict[str, Any]]) -> list[dict[str, Any
             "role": role,
             "content": redact_obj(message.get("content")),
         }
+
+        # Preserve the teacher's natural-language reasoning. The Azure Responses
+        # API stores it on the assistant message at extra.reasoning_summary; the
+        # Gemma 4 chat template renders a `reasoning` field as a <|channel>thought
+        # block for tool-call turns after the last user message (exactly the turns
+        # the trainer supervises), so it lands in the loss target. Without this the
+        # reasoning is silently dropped at normalization (the original SFT bug).
+        if role == "assistant":
+            reasoning = (message.get("extra") or {}).get("reasoning_summary")
+            if reasoning:
+                item["reasoning"] = redact_text(reasoning)
 
         if role == "assistant" and message.get("tool_calls"):
             tool_calls = []
