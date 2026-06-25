@@ -1,0 +1,72 @@
+exp_name: gemma4-31b-lora-text-16k
+output_dir: /lab/hpc/redwing/wrk/anl31/vuljector-runs/${exp_name}
+
+# Model
+model_id: google/gemma-4-31B-it
+tokenizer_id: google/gemma-4-31B-it
+initial_model_id: ${INITIAL_MODEL_ID}
+attn_implementation: sdpa
+dtype: bf16
+
+# LoRA: base frozen (can't catastrophically forget), low-rank adapters on attn+MLP.
+# Trains ~0.5-1% of params, removes the 31B optimizer states -> a 32k window fits under DDP.
+lora:
+  r: 32
+  alpha: 64
+  dropout: 0.05
+  # Regex (PEFT does re.fullmatch): target ONLY language_model nn.Linear projections.
+  # A plain suffix list also matches the vision tower's Gemma4ClippableLinear wrappers,
+  # which PEFT can't inject into (and which we don't want to adapt for a text task).
+  target_modules: '.*language_model.*\.(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj)$'
+
+# Dataset: NEW v4 data (1083 traj, +41% vs v3's 766; pushed 2026-06-25). Window 16384
+# tests the truncation limitation (median traj ~20k tok -> 16k still truncates ~64%).
+# Fresh cache_v4 so the v3 tokenization isn't reused.
+dataset:
+  data_files: data/processed/normalized_trajectories_v4_text.jsonl
+  max_seq_len: 16384
+  cache_dir: data/processed/cache_v4
+  max_train_examples: 0
+  eval_fraction: 0.03
+
+# Optimizer/scheduler -- LoRA tolerates a higher LR than full-FT.
+optimizer:
+  name: adamw_torch_fused
+  weight_decay: 0.0
+  lr: 1.0e-4
+lr_scheduler:
+  name: cosine
+  warmup_ratio: 0.03
+
+# Training -- DDP (NO fsdp block => transformers uses plain DDP; base replicated per GPU,
+# fits in 141GB H200 with the base frozen). gradient_checkpointing on (no fsdp activation
+# checkpointing to conflict with now).
+seed: 42
+shuffle: true
+batch_size: 1
+epochs: 3
+max_steps: -1
+gradient_accumulation_steps: 2
+gradient_checkpointing: true
+max_grad_norm: 1.0
+ddp_find_unused_parameters: false
+
+# Logging/checkpointing -- adapters are tiny (~hundreds of MB), so saves are cheap/fast.
+wandb:
+  project: vuljector-secbench
+  group: ${exp_name}
+  job_type: lora_ddp
+  key_file: ${WANDB_KEY_FILE}
+hub:
+  upload_checkpoints: false
+  repo_id: AmL-hug/gemma4-31b-lora
+  token_file: ${HF_KEY_FILE}
+  private: false
+  repo_type: model
+  fail_on_error: false
+log_every_n_steps: 1
+save_steps: 250
+save_total_limit: 2
+save_only_model: true
+save_final_model: true
+eval_steps: 500

@@ -7,6 +7,7 @@ import json
 import os
 import random
 import re
+import sys
 from datetime import timedelta
 from pathlib import Path
 from typing import Any
@@ -16,6 +17,45 @@ import torch.distributed as dist
 import yaml
 from torch.utils.data import Dataset, Subset
 from transformers import TrainerCallback
+
+# agent_data lives at the repo root (one level above scripts/).
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from agent_data import BASH_TOOLS  # noqa: E402
+
+# Disable cuDNN's fused SDPA backend: it crashed mid-run with
+# "mha_graph.execute(...).is_good() == false" on certain sequence shapes (job 62465 died
+# at step 249). Force PyTorch SDPA onto the reliable flash / mem-efficient kernels instead.
+torch.backends.cuda.enable_cudnn_sdp(False)
+torch.backends.cuda.enable_flash_sdp(True)
+torch.backends.cuda.enable_mem_efficient_sdp(True)
+
+# Make checkpoint saves resilient to transient Weka I/O glitches: job 62477 died when a
+# safetensors shard write returned ENODEV ("No such device") mid-save -- the Weka scratch
+# (weka01-08.ib) momentarily glitched on one ~50GB write (disk 50% free, RAM fine, node
+# healthy, so not space/OOM/node). Retry the shard write with backoff so a transient blip
+# doesn't kill a multi-hour run. Patch both the safetensors symbol and the one transformers
+# bound at import (save_pretrained -> safe_save_file).
+import time as _time  # noqa: E402
+import safetensors.torch as _sft  # noqa: E402
+import transformers.modeling_utils as _mu  # noqa: E402
+
+_orig_safe_save_file = _sft.save_file
+
+
+def _save_file_retry(*args, **kwargs):
+    for _attempt in range(5):
+        try:
+            return _orig_safe_save_file(*args, **kwargs)
+        except Exception as _exc:  # noqa: BLE001 -- transient FS errors (ENODEV etc.)
+            if _attempt == 4:
+                raise
+            print(f"[save-retry] safetensors write failed ({_exc}); "
+                  f"retry {_attempt + 1}/4 in {5 * (_attempt + 1)}s", flush=True)
+            _time.sleep(5 * (_attempt + 1))
+
+
+_sft.save_file = _save_file_retry
+_mu.safe_save_file = _save_file_retry
 
 
 def parse_args() -> argparse.Namespace:
@@ -130,6 +170,64 @@ def is_terminal_submit_action(message: dict[str, Any]) -> bool:
     return False
 
 
+# --- Assistant-token masking via the chat template -------------------------
+# Best-practice SFT masks loss to exactly the assistant-generated tokens using
+# the `{% generation %}` / `{% endgeneration %}` chat-template markers and
+# `apply_chat_template(return_assistant_tokens_mask=True)` (see HF/TRL
+# assistant_only_loss). Gemma 4's shipped template has no such markers, so we
+# inject them into a *training-only* copy of the template. The markers are
+# placed to capture: the reasoning thought block + tool-call(s) + any assistant
+# text content, while EXCLUDING role headers, the (forward-scanned) tool
+# responses, and the pending `<|tool_response>` opener the template appends
+# after a tool call. The base serving template is left untouched.
+_GEN_OPEN_REASONING_TOOLCALL = "    {#- Render reasoning/reasoning_content as thinking channel -#}"
+_GEN_CLOSE_TOOLCALL = (
+    "                {%- set ns.prev_message_type = 'tool_call' -%}\n"
+    "            {%- endif -%}\n"
+)
+_GEN_CONTENT = "            {{- captured_content -}}\n"
+
+
+def build_training_chat_template(base_template: str) -> str:
+    """Return a copy of the Gemma 4 chat template with {% generation %} markers
+    around the assistant-generated spans, for return_assistant_tokens_mask."""
+    if "{% generation %}" in base_template:
+        return base_template
+
+    def require(anchor: str, label: str) -> None:
+        count = base_template.count(anchor)
+        if count != 1:
+            raise ValueError(
+                f"Cannot add assistant-mask markers: anchor '{label}' found {count} times "
+                "(expected 1). The Gemma 4 chat template differs from the verified version."
+            )
+
+    require(_GEN_OPEN_REASONING_TOOLCALL, "reasoning/tool_call open")
+    require(_GEN_CLOSE_TOOLCALL, "tool_call close")
+    require(_GEN_CONTENT, "content")
+
+    # Span 1: reasoning + tool_calls. Only assistant ('model') messages emit
+    # content here (reasoning requires tool_calls; tool_calls require the key),
+    # so wrapping unconditionally yields an empty span for other roles.
+    template = base_template.replace(
+        _GEN_OPEN_REASONING_TOOLCALL,
+        "    {% generation %}\n" + _GEN_OPEN_REASONING_TOOLCALL,
+    )
+    template = template.replace(
+        _GEN_CLOSE_TOOLCALL,
+        _GEN_CLOSE_TOOLCALL + "            {% endgeneration %}\n",
+    )
+    # Span 2: assistant text content. captured_content is emitted for every
+    # role, so guard by role and keep open+close inside the same if-branch
+    # (Jinja requires generation blocks balanced within a block scope).
+    template = template.replace(
+        _GEN_CONTENT,
+        "            {%- if role == 'model' -%}{% generation %}{{- captured_content -}}{% endgeneration %}"
+        "{%- else -%}{{- captured_content -}}{%- endif -%}\n",
+    )
+    return template
+
+
 class MiniSweTurnDataset(Dataset):
     def __init__(
         self,
@@ -144,10 +242,14 @@ class MiniSweTurnDataset(Dataset):
         self.tokenizer = tokenizer
         self.max_seq_length = max_seq_length
         self.max_examples = max_examples
+        # Training-only template with {% generation %} markers for exact
+        # assistant-token masking (does not affect the saved/serving template).
+        base_template = tokenizer.chat_template or tokenizer.get_chat_template()
+        self.train_template = build_training_chat_template(base_template)
         cache_dir.mkdir(parents=True, exist_ok=True)
         self.cache_path = (
             cache_dir
-            / f"mini_swe_turns_full_{safe_model_id(cache_model_id)}_{max_seq_length}_{max_examples}.pt"
+            / f"mini_swe_turns_genmask_headtail_{safe_model_id(cache_model_id)}_{max_seq_length}_{max_examples}.pt"
         )
         self.examples = self._load_or_build()
         if not self.examples:
@@ -182,52 +284,115 @@ class MiniSweTurnDataset(Dataset):
             "labels": torch.as_tensor(example["labels"], dtype=torch.long),
         }
 
-    def _encode_messages(self, messages: list[dict[str, Any]], add_generation_prompt: bool) -> list[int]:
-        return to_list(
-            self.tokenizer.apply_chat_template(
-                messages,
-                tokenize=True,
-                add_generation_prompt=add_generation_prompt,
-            )
+    def _encode_with_mask(self, messages: list[dict[str, Any]]) -> tuple[list[int], list[int]]:
+        """Encode messages and return (input_ids, assistant_mask) where the mask
+        is 1 for tokens generated by the assistant (reasoning + tool calls +
+        text content) and 0 for everything else, via the {% generation %} markers."""
+        enc = self.tokenizer.apply_chat_template(
+            messages,
+            tools=BASH_TOOLS,
+            chat_template=self.train_template,
+            tokenize=True,
+            add_generation_prompt=False,
+            return_assistant_tokens_mask=True,
+            return_dict=True,
         )
+        return to_list(enc["input_ids"]), [int(m) for m in enc["assistant_masks"]]
 
     def _build_examples(self) -> list[dict[str, torch.Tensor]]:
         examples: list[dict[str, torch.Tensor]] = []
         for row in self.rows:
             messages = row.get("messages") or []
+            # HEAD = <bos> + system + first user message (task / bug description +
+            # sanitizer report). On over-length examples we preserve this head and
+            # middle-truncate (see below): edit turns are the longest examples (they
+            # come late, after recon), so plain left-truncation stripped the task
+            # framing from ~78% of them -- training the model to emit a fix with no
+            # statement of what to fix and no action rules, off-distribution from the
+            # fully-framed context it always sees at eval. Head is ~2k tokens (p90 3.5k).
+            head_end = 1
+            while head_end < len(messages) and messages[head_end].get("role") != "user":
+                head_end += 1
+            try:
+                head_ids, _ = self._encode_with_mask(messages[: head_end + 1])
+                head_len = len(head_ids)
+            except Exception:
+                head_len = 0
             for idx, message in enumerate(messages):
                 if message.get("role") != "assistant":
                     continue
-                if not message.get("tool_calls"):
+                # Supervise tool-call turns (tool-calling data) OR plain-content turns
+                # (TEXT-mode data: assistant content = THOUGHT + ```mswea_bash_command``` block).
+                # The {% generation %} content span already masks assistant content, so the
+                # target-position logic below works for both shapes.
+                if not message.get("tool_calls") and not message.get("content"):
                     continue
-                if is_terminal_submit_action(message):
-                    continue
+                # NOTE: previously the terminal submit action (echo
+                # COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT) was skipped here. It is now
+                # SUPERVISED so the model learns WHEN to stop -- at eval the model never
+                # submitted (rambled instead). is_terminal_submit_action is kept for
+                # reference but no longer excludes the turn.
 
-                prefix_messages = messages[:idx]
-                full_messages = messages[: idx + 1]
                 try:
-                    prefix_ids = self._encode_messages(prefix_messages, add_generation_prompt=True)
-                    full_ids = self._encode_messages(full_messages, add_generation_prompt=False)
+                    _, prefix_mask = self._encode_with_mask(messages[:idx])
+                    full_ids, full_mask = self._encode_with_mask(messages[: idx + 1])
                 except Exception as exc:
                     log_phase(f"skipping example {row.get('id')} turn {idx}: chat template failed: {exc}")
                     continue
 
-                if len(full_ids) <= len(prefix_ids):
+                # The current action's supervised tokens are the assistant tokens
+                # in messages[:idx+1] that are not already present in messages[:idx]
+                # -- i.e. the last (m_full - m_prefix) masked positions. This is the
+                # reasoning thought + tool call (+ text content) for this turn, and
+                # never the pending <|tool_response>/tool output (masked by the markers).
+                masked_positions = [p for p, flag in enumerate(full_mask) if flag]
+                num_target = len(masked_positions) - sum(prefix_mask)
+                if num_target <= 0:
                     continue
+                target_positions = masked_positions[-num_target:]
 
-                label_start = len(prefix_ids)
-                if len(full_ids) > self.max_seq_length:
-                    overflow = len(full_ids) - self.max_seq_length
-                    full_ids = full_ids[overflow:]
-                    label_start = max(0, label_start - overflow)
+                # STOP-TOKEN FIX: the token immediately after the last supervised action token is
+                # the turn/handoff stop (<|tool_response> id 50, <turn|> 106, or <eos> 1 -- all in
+                # generation_config.eos_token_id). The old cut DROPPED it, so the model never learned
+                # to STOP after a tool-call and over-generated at inference (finish_reason=length,
+                # dozens of duplicate tool-calls, 0 edits). Supervise it so the model learns to stop.
+                sp = target_positions[-1] + 1
+                if sp < len(full_ids) and full_ids[sp] in (50, 106, 1):
+                    target_positions = target_positions + [sp]
 
-                labels = [-100] * label_start + full_ids[label_start:]
+                # Cut context at the end of the action (now INCLUDING the supervised stop token)
+                # and supervise the action tokens + that stop.
+                input_ids = full_ids[: target_positions[-1] + 1]
+                labels = [-100] * len(input_ids)
+                for p in target_positions:
+                    labels[p] = full_ids[p]
+
+                if len(input_ids) > self.max_seq_length:
+                    # MIDDLE-TRUNCATION: keep the HEAD (bos + system + task/bug
+                    # description) and the TAIL (recent recon + the supervised action),
+                    # eliding the middle. The action lives at the very end so it is always
+                    # in the tail; the head is never supervised (its labels are already
+                    # -100). This keeps the task framing the model has at eval -- plain
+                    # left-truncation stripped it from ~78% of edit turns. Fall back to
+                    # left-truncation only if the head alone is implausibly large.
+                    if 0 < head_len < self.max_seq_length - 512:
+                        tail_budget = self.max_seq_length - head_len
+                        input_ids = input_ids[:head_len] + input_ids[-tail_budget:]
+                        labels = ([-100] * head_len) + labels[-tail_budget:]
+                    else:
+                        input_ids = input_ids[-self.max_seq_length :]
+                        labels = labels[-self.max_seq_length :]
+                        bos = self.tokenizer.bos_token_id
+                        if bos is not None and input_ids[0] != bos:
+                            input_ids[0] = bos
+                            labels[0] = -100
+
                 if all(label == -100 for label in labels):
                     continue
 
                 examples.append(
                     {
-                        "input_ids": torch.tensor(full_ids, dtype=torch.long),
+                        "input_ids": torch.tensor(input_ids, dtype=torch.long),
                         "labels": torch.tensor(labels, dtype=torch.long),
                     }
                 )
@@ -349,6 +514,17 @@ def configure_train_scope(model: torch.nn.Module, scope: str) -> None:
                 or name == "lm_head.weight"
                 or name.endswith(".lm_head.weight")
             )
+        elif scope == "language_model_no_embed":
+            # Train the decoder layers + norms but FREEZE the (tied) input/output
+            # embedding. Full-FT of embed_tokens/lm_head at lr 1e-5 collapsed the
+            # output distribution into garbage; freezing it preserves the vocab mapping.
+            is_lm = (
+                name.startswith("language_model.")
+                or name.startswith("model.language_model.")
+            )
+            is_embed = "embed_tokens" in name
+            is_lmhead = name == "lm_head.weight" or name.endswith(".lm_head.weight")
+            should_train = is_lm and not is_embed and not is_lmhead
         else:
             raise ValueError(f"Unknown train_scope: {scope}")
         param.requires_grad_(should_train)
@@ -357,6 +533,39 @@ def configure_train_scope(model: torch.nn.Module, scope: str) -> None:
         else:
             frozen += param.numel()
     print(f"Train scope {scope}: trainable={trainable:,} frozen={frozen:,}", flush=True)
+
+
+def verify_save_integrity(save_dir: str, base_dir: str, min_cos: float = 0.5) -> list[int]:
+    """Detect decoder layers that a consolidated FSDP save failed to gather (they
+    retain fresh-init weights). Compares each layer's input_layernorm.weight cosine
+    to the base model; a gathered layer is ~1.0, an un-gathered one is ~0. Low memory
+    (one small tensor per layer). Returns the list of corrupted layer indices."""
+    from safetensors import safe_open
+
+    def widx(d: str) -> dict:
+        return json.load(open(os.path.join(d, "model.safetensors.index.json")))["weight_map"]
+
+    try:
+        wf, wb = widx(save_dir), widx(base_dir)
+    except Exception as exc:
+        log_phase(f"save-integrity check skipped (no consolidated index, e.g. LoRA adapter): {exc}")
+        return []
+    layers = sorted({int(m.group(1)) for k in wf for m in [re.search(r"layers\.(\d+)\.", k)] if m})
+    bad: list[int] = []
+    for layer in layers:
+        key = next((k for k in wf if f"layers.{layer}.input_layernorm.weight" in k), None)
+        if key is None or key not in wb:
+            continue
+        try:
+            a = safe_open(os.path.join(save_dir, wf[key]), framework="pt").get_slice(key)[:].float()
+            b = safe_open(os.path.join(base_dir, wb[key]), framework="pt").get_slice(key)[:].float()
+            cos = float((a * b).sum() / ((a.norm() * b.norm()) + 1e-30))
+        except Exception as exc:
+            log_phase(f"save-integrity: could not check layer {layer}: {exc}")
+            continue
+        if cos < min_cos:
+            bad.append(layer)
+    return bad
 
 
 def main() -> None:
@@ -394,7 +603,10 @@ def main() -> None:
         rows=rows,
         tokenizer=tokenizer,
         cache_dir=Path(dataset_cfg["cache_dir"]),
-        cache_model_id=config["model_id"],
+        # Include the data-file stem so the cache key is DATA-AWARE (different data ->
+        # different cache). Without this, a text-mode run would silently reload the
+        # tool-mode cache built at the same seq_len.
+        cache_model_id=config["model_id"] + "_" + Path(dataset_cfg["data_files"]).stem,
         max_seq_length=int(dataset_cfg["max_seq_len"]),
         max_examples=int(dataset_cfg.get("max_train_examples") or 0),
     )
@@ -412,7 +624,33 @@ def main() -> None:
     )
     log_phase("model loaded; configuring train scope")
     model.config.use_cache = False
-    configure_train_scope(model, config.get("train_scope", "language_model"))
+    lora_cfg = config.get("lora")
+    if lora_cfg:
+        # LoRA path: freeze the base, train low-rank adapters. Frozen base structurally
+        # prevents catastrophic forgetting, and removes the 31B optimizer states (so a
+        # larger window fits). Runs under DDP (no fsdp block in the LoRA config).
+        from peft import LoraConfig, get_peft_model
+        # target_modules may be a regex STRING (e.g. to hit only language_model.* linears and
+        # skip the vision tower's Gemma4ClippableLinear wrappers) or a list of name suffixes.
+        tm = lora_cfg.get(
+            "target_modules",
+            ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+        )
+        peft_config = LoraConfig(
+            r=int(lora_cfg.get("r", 16)),
+            lora_alpha=int(lora_cfg.get("alpha", 32)),
+            lora_dropout=float(lora_cfg.get("dropout", 0.05)),
+            target_modules=tm if isinstance(tm, str) else list(tm),
+            bias="none",
+            task_type="CAUSAL_LM",
+        )
+        model = get_peft_model(model, peft_config)
+        # With a frozen base, gradient checkpointing needs grads to flow into the inputs.
+        model.enable_input_require_grads()
+        if int(os.environ.get("RANK", "0")) == 0:
+            model.print_trainable_parameters()
+    else:
+        configure_train_scope(model, config.get("train_scope", "language_model"))
     if config.get("gradient_checkpointing", True):
         model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
     log_phase("model train scope configured")
@@ -468,6 +706,7 @@ def main() -> None:
         fsdp_config=fsdp_cfg,
         gradient_checkpointing=bool(config.get("gradient_checkpointing", True)),
         gradient_checkpointing_kwargs={"use_reentrant": False},
+        ddp_find_unused_parameters=config.get("ddp_find_unused_parameters"),
         ddp_timeout=3600,
     )
 
@@ -500,6 +739,26 @@ def main() -> None:
         trainer.save_model(str(output_dir / "final_model"))
         tokenizer.save_pretrained(output_dir / "final_model")
         print(f"Saved final model to {output_dir / 'final_model'}", flush=True)
+        # SAVE-INTEGRITY GATE: the FSDP FULL_STATE_DICT consolidation in the final
+        # save has been observed to silently drop the LAST decoder layer (leaving
+        # fresh-init garbage -> the model emits token-salad). Verify and flag loudly;
+        # the in-loop checkpoints are reliable and should be used if this fails.
+        if int(os.environ.get("RANK", "0")) == 0:
+            base_dir = initial_model_id
+            try:
+                from huggingface_hub import snapshot_download
+                base_dir = snapshot_download(config["model_id"])
+            except Exception:
+                pass
+            bad = verify_save_integrity(str(output_dir / "final_model"), str(base_dir))
+            if bad:
+                msg = (f"SAVE-INTEGRITY FAILURE: final_model decoder layer(s) {bad} are CORRUPTED "
+                       f"(cosine-to-base ~0 -> FSDP consolidation did not gather them). DO NOT use "
+                       f"final_model; use the last in-loop checkpoint under {output_dir} instead.")
+                log_phase("ERROR: " + msg)
+                (output_dir / "final_model" / "SAVE_CORRUPTED.txt").write_text(msg + "\n", encoding="utf-8")
+            else:
+                log_phase("save-integrity check PASSED: all decoder layers gathered (no collapse).")
     else:
         log_phase("trainer.train() completed; skipping final_model duplicate save")
 

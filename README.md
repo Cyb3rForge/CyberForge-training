@@ -39,6 +39,15 @@ complete Mini-SWE history up through that action, and loss is applied only to
 the current assistant action. User prompts, system text, and terminal/tool
 observations are context, not targets.
 
+Loss masking uses the chat template's `{% generation %}` markers with
+`apply_chat_template(return_assistant_tokens_mask=True)` (the HF/TRL
+`assistant_only_loss` best practice), via a training-only copy of the Gemma 4
+template built at runtime by `build_training_chat_template`. The supervised span
+is exactly the action's reasoning thought block + tool call(s) + any assistant
+text, and never the role headers, tool observations, or the pending
+`<|tool_response>` marker the template appends after a tool call. The serving
+template is unchanged.
+
 ## Prep
 
 ```bash
