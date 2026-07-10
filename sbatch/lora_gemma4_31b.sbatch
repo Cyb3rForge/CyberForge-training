@@ -27,7 +27,7 @@
 # (page cache during the write too). NB: the prior run's mid-write SIGKILL was
 # the home disk quota, not memory -- now fixed by writing to Weka scratch.
 #SBATCH --mem=1400G
-#SBATCH --time=48:00:00
+#SBATCH --time=6-00:00:00
 #SBATCH --output=slurm_logs/%x-%j.out
 #SBATCH --error=slurm_logs/%x-%j.err
 
@@ -118,6 +118,19 @@ if [[ ! -s "${DATA_FILE}" ]]; then
 fi
 echo "data rows: $(wc -l < "${DATA_FILE}")"
 
-torchrun --standalone --nnodes=1 --nproc_per_node="${NPROC}" \
+# Explicit localhost rendezvous: --standalone derived a bad host ("dmidecode") on this
+# node's broken hostname resolution -> TCPStore timeout. Force c10d on 127.0.0.1.
+# This node's hostname is 'dmidecode', which does not resolve -> torchrun's c10d agent +
+# all env:// rendezvous fail. Map it to loopback via glibc HOSTALIASES (user-level, no root).
+HOSTNAME_SELF=$(hostname)
+echo "${HOSTNAME_SELF} localhost" > "${PROJECT_DIR}/.hostaliases"
+export HOSTALIASES="${PROJECT_DIR}/.hostaliases"
+export MASTER_ADDR=127.0.0.1
+RDZV_PORT=$(( 20000 + ${SLURM_JOB_ID:-0} % 10000 ))
+export MASTER_PORT=${RDZV_PORT}
+# --local-addr forces the agent's own address to loopback (node hostname 'dmidecode' does
+# not resolve); --master-addr/-port give a static rendezvous. Single node -> all loopback.
+torchrun --nnodes=1 --nproc_per_node="${NPROC}" --node-rank=0 \
+  --master-addr=127.0.0.1 --master-port="${RDZV_PORT}" --local-addr=127.0.0.1 \
   scripts/train_gemma4_full_sft.py \
   --config "${CONFIG}"

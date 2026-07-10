@@ -67,6 +67,10 @@ hub:
 log_every_n_steps: 1
 save_steps: 250
 save_total_limit: 2
-save_only_model: true
+save_only_model: false   # save optimizer+scheduler so a timeout/preemption can resume cleanly
 save_final_model: true
 eval_steps: 500
+# Resume the timed-out 48h run (62990) from epoch 1.28; same gpu:8 world size keeps the
+# LR schedule (max_steps=3633) continuous. (checkpoint-1500 has adapter only -> fresh
+# optimizer on resume, minor; future checkpoints are now resumable.)
+resume_from_checkpoint: ""

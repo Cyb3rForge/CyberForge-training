@@ -42,3 +42,10 @@ configs/train/lora_text.yml
 configs/train/lora_gemma4_31b_8xh200.yml
 sbatch/full_ft_*.sbatch
 sbatch/gen_check.sbatch
+
+# Unsloth run outputs & build artifacts (not source)
+runs_unsloth/
+unsloth_compiled_cache/
+.venv-unsloth.lock
+# torchrun rendezvous helper written at job start (node hostname -> localhost)
+.hostaliases

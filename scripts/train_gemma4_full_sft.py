@@ -9,6 +9,12 @@ import random
 import re
 import sys
 from datetime import timedelta
+
+# This node's `hostname` returns 'dmidecode', which does not resolve to an IP; torchrun
+# then sets MASTER_ADDR to it and every env:// rendezvous times out. All ranks are on one
+# node here, so force loopback before any torch/accelerate/dist code runs.
+if int(os.environ.get("WORLD_SIZE", "1")) > 1:
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
 from pathlib import Path
 from typing import Any
 
@@ -113,6 +119,10 @@ def configure_early_fsdp_env(fsdp_cfg: dict[str, Any]) -> None:
         os.environ.setdefault("FSDP_CPU_RAM_EFFICIENT_LOADING", "true")
         os.environ.setdefault("FSDP_SYNC_MODULE_STATES", "true")
     if int(os.environ.get("WORLD_SIZE", "1")) > 1 and not dist.is_initialized():
+        # This node's `hostname` returns 'dmidecode' which does not resolve to an IP, so
+        # torchrun sets MASTER_ADDR to it and env:// rendezvous times out. Force loopback
+        # (single-node DDP/FSDP): all ranks are local, so 127.0.0.1 is always correct.
+        os.environ["MASTER_ADDR"] = "127.0.0.1"
         log_phase("initializing process group before from_pretrained for FSDP efficient loading")
         dist.init_process_group(
             backend="nccl",
