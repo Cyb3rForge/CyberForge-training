@@ -17,6 +17,8 @@ __pycache__/
 
 # Generated training data and artifacts
 data/processed/
+data/hf_dataset/
+data/_hf_dataset/
 runs/
 wandb/
 slurm_logs/
@@ -26,3 +28,24 @@ slurm_logs/
 *.safetensors
 *.bin
 *.pt
+
+# One-off diagnostics & analysis (not part of the LoRA SFT pipeline)
+scripts/diag_*.py
+scripts/measure_*.py
+scripts/analyze_*.py
+scripts/gen_check*.py
+
+# Superseded / non-LoRA experiment configs & launchers (keep the lora_text_* SFT series)
+configs/train/full_ft_*.yml
+configs/train/lora_v3_32k.yml
+configs/train/lora_text.yml
+configs/train/lora_gemma4_31b_8xh200.yml
+sbatch/full_ft_*.sbatch
+sbatch/gen_check.sbatch
+
+# Unsloth run outputs & build artifacts (not source)
+runs_unsloth/
+unsloth_compiled_cache/
+.venv-unsloth.lock
+# torchrun rendezvous helper written at job start (node hostname -> localhost)
+.hostaliases

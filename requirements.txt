@@ -1,0 +1,8 @@
+torch
+transformers>=5.8.1
+peft
+accelerate
+safetensors
+pyyaml
+jinja2
+liger-kernel

@@ -1,0 +1,66 @@
+# LoRA fine-tune of Gemma-4-E4B on the normalized teacher trajectories.
+# Runs under plain DDP (no fsdp block): base is replicated per GPU and frozen, so a
+# larger context window fits. Run with:
+#   torchrun --nproc_per_node=<N> scripts/train_gemma4_full_sft.py --config configs/train/gemma4_e4b_lora.yml
+exp_name: gemma4-e4b-lora
+output_dir: ${OUTPUT_ROOT}/${exp_name}
+
+# Model
+model_id: google/gemma-4-E4B-it
+tokenizer_id: google/gemma-4-E4B-it
+attn_implementation: sdpa
+dtype: bf16
+
+# LoRA: base frozen, low-rank adapters on the language-model attn+MLP projections.
+lora:
+  r: 32
+  alpha: 64
+  dropout: 0.05
+  # Regex (PEFT re.fullmatch): target ONLY language-model linear projections; a plain
+  # suffix list would also match the vision tower's wrappers, which PEFT can't inject into.
+  target_modules: '.*language_model.*\.(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj)$'
+
+# Dataset: output of scripts/normalize_trajectories.py. 32k window is affordable because
+# LoRA frees the optimizer memory the full-FT path spends on the base weights.
+dataset:
+  data_files: data/processed/normalized_trajectories.jsonl
+  max_seq_len: 32768
+  cache_dir: data/processed/cache
+  max_train_examples: 0
+  eval_fraction: 0.03
+
+# LoRA tolerates a higher LR than full-FT.
+optimizer:
+  name: adamw_torch_fused
+  weight_decay: 0.0
+  lr: 1.0e-4
+lr_scheduler:
+  name: cosine
+  warmup_ratio: 0.03
+
+seed: 42
+shuffle: true
+batch_size: 1
+epochs: 3
+max_steps: -1
+gradient_accumulation_steps: 2
+gradient_checkpointing: true
+max_grad_norm: 1.0
+ddp_find_unused_parameters: false
+
+wandb:
+  project: cyberforge
+  group: ${exp_name}
+  job_type: lora_ddp
+hub:
+  upload_checkpoints: false
+  repo_id: your-namespace/gemma4-e4b-lora
+  private: false
+  repo_type: model
+  fail_on_error: false
+log_every_n_steps: 1
+save_steps: 500
+save_total_limit: 2
+save_only_model: true
+save_final_model: true
+eval_steps: 500
